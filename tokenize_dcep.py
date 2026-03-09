@@ -2,12 +2,12 @@
 """
 Tokenize extracted DCEP-2013 plain-text files and produce word-frequency-length tables.
 
-Expected directory structure (per language):
-    <input_root>/
-        <LANG>/
-            OQ/   *.txt   (oral questions)
-            QT/   *.txt   (question time)
-            REPORT/       <- IGNORED (not present in all languages)
+Reads per-language file lists produced by analyse_index.py (--save-paths).
+Each filelist contains paths like:
+    xml/EL/RULES-EP/6737258__RULES-EP__20040501__EL.xml.gz
+
+These are translated to actual .txt paths under --input-root, e.g.:
+    <input-root>/EL/RULES-EP/6737258__RULES-EP__20040501__EL.txt
 
 Output (one file per language, saved to --out-dir):
     <iso>.txt  with three tab-separated columns:
@@ -15,14 +15,22 @@ Output (one file per language, saved to --out-dir):
 
 Usage
 -----
-    python tokenize_dcep.py --input dcep_downloads/ --out-dir data/
-    python tokenize_dcep.py --input dcep_downloads/ --langs EN FR FI HU MT GA BG
-    python tokenize_dcep.py --input dcep_downloads/ --no-spacy   # fastest option
+    # Tokenize all languages whose filelist exists in parallel_selection/:
+    python tokenize_dcep.py \\
+        --filelists parallel_selection/ \\
+        --input-root /path/to/dcep/texts/ \\
+        --out-dir data/
+
+    # Fastest: regex tokenizer for all languages (no spaCy needed)
+    python tokenize_dcep.py \\
+        --filelists parallel_selection/ \\
+        --input-root /path/to/dcep/texts/ \\
+        --no-spacy
 
 Requirements
 ------------
     pip install spacy tqdm
-    python -m spacy download en_core_web_sm   # repeat for each language
+    python -m spacy download en_core_web_sm   # only if using spaCy
 """
 
 from __future__ import annotations
@@ -115,31 +123,70 @@ def spacy_tokenize(text: str, lang: str) -> list[str]:
     return [token.lower_ for token in nlp(text) if token.is_alpha]
 
 # ---------------------------------------------------------------------------
-# File discovery — OQ and QT only, REPORT ignored
+# File resolution from filelists
+#
+# Filelist lines look like:
+#   xml/EL/RULES-EP/6737258__RULES-EP__20040501__EL.xml.gz
+#
+# We strip the leading "xml/" and the trailing ".xml.gz", then append ".txt",
+# giving a relative path:
+#   EL/RULES-EP/6737258__RULES-EP__20040501__EL.txt
+#
+# That is then joined with --input-root to get the absolute path.
 # ---------------------------------------------------------------------------
-INCLUDE_SUBDIRS = {"OQ", "QT"}
 
-def find_lang_files(lang_root: Path) -> list[Path]:
-    files = []
-    for subdir in INCLUDE_SUBDIRS:
-        d = lang_root / subdir
-        if d.is_dir():
-            files.extend(sorted(d.glob("*.txt")))
-    return files
+def filelist_path_to_txt(raw: str, input_root: Path) -> Path:
+    """Convert an index path entry to the actual .txt file path."""
+    # Strip leading "xml/" prefix if present
+    if raw.startswith("xml/"):
+        raw = raw[4:]
+    # Strip .xml.gz and replace with .txt
+    if raw.endswith(".xml.gz"):
+        raw = raw[:-7] + ".txt"
+    elif raw.endswith(".xml"):
+        raw = raw[:-4] + ".txt"
+    return input_root / raw
 
-def find_languages(input_root: Path) -> dict[str, list[Path]]:
+
+def load_filelists(filelists_dir: Path, input_root: Path) -> dict[str, list[Path]]:
+    """
+    Read all filelist_<LANG>.txt files from filelists_dir.
+    Returns {lang -> [resolved .txt Paths]}, skipping files that don't exist.
+    """
     lang_map: dict[str, list[Path]] = {}
-    for child in sorted(input_root.iterdir()):
-        if not child.is_dir():
+
+    filelist_files = sorted(filelists_dir.glob("filelist_*.txt"))
+    if not filelist_files:
+        print(f"[error] No filelist_*.txt files found in {filelists_dir}", file=sys.stderr)
+        return lang_map
+
+    for fl in filelist_files:
+        # Extract lang code from filename: filelist_EL.txt -> EL
+        m = re.match(r"filelist_([A-Z]{2})\.txt$", fl.name, re.IGNORECASE)
+        if not m:
             continue
-        code = child.name.upper()
-        if not re.match(r"^[A-Z]{2}$", code):
-            continue
-        files = find_lang_files(child)
-        if files:
-            lang_map[code] = files
+        lang = m.group(1).upper()
+
+        resolved: list[Path] = []
+        missing = 0
+        for line in fl.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            txt_path = filelist_path_to_txt(line, input_root)
+            if txt_path.exists():
+                resolved.append(txt_path)
+            else:
+                missing += 1
+
+        if missing > 0:
+            print(f"  [warn] {lang}: {missing} paths from filelist not found on disk",
+                  file=sys.stderr)
+        if resolved:
+            lang_map[lang] = resolved
         else:
-            print(f"  [skip] {code}: no OQ/QT .txt files found", file=sys.stderr)
+            print(f"  [skip] {lang}: no files resolved from filelist", file=sys.stderr)
+
     return lang_map
 
 # ---------------------------------------------------------------------------
@@ -186,14 +233,18 @@ def write_table(rows: list[tuple[str, int, int]], out_path: Path) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Tokenize DCEP plain-text files -> word/frequency/length tables."
+        description="Tokenize DCEP parallel .txt files -> word/frequency/length tables."
     )
-    p.add_argument("--input", required=True,
-                   help="Root dir with per-language folders (e.g. dcep_downloads/).")
+    p.add_argument("--filelists", required=True,
+                   help="Directory containing filelist_<LANG>.txt files "
+                        "(output of analyse_index.py --save-paths).")
+    p.add_argument("--input-root", required=True,
+                   help="Root directory where the actual .txt files live. "
+                        "Filelist paths are resolved relative to this.")
     p.add_argument("--out-dir", default="data",
-                   help="Output directory for <iso>.txt files (default: data/).")
+                   help="Output directory for <iso>.txt tables (default: data/).")
     p.add_argument("--langs", nargs="*", default=None,
-                   help="Language codes to process. Default: all found.")
+                   help="Only process these language codes (default: all filelists found).")
     p.add_argument("--min-freq", type=int, default=1,
                    help="Min token frequency to include (default: 1).")
     p.add_argument("--no-spacy", action="store_true",
@@ -201,19 +252,27 @@ def main() -> int:
                         "Fastest option — document in Methods if used.")
     args = p.parse_args()
 
-    input_root = Path(args.input)
-    out_dir = Path(args.out_dir)
+    filelists_dir = Path(args.filelists)
+    input_root    = Path(args.input_root)
+    out_dir       = Path(args.out_dir)
 
-    lang_map = find_languages(input_root)
+    if not filelists_dir.is_dir():
+        print(f"[error] --filelists directory not found: {filelists_dir}", file=sys.stderr)
+        return 1
+    if not input_root.is_dir():
+        print(f"[error] --input-root directory not found: {input_root}", file=sys.stderr)
+        return 1
+
+    lang_map = load_filelists(filelists_dir, input_root)
     if not lang_map:
-        print(f"[error] No language folders found under {input_root}.", file=sys.stderr)
+        print("[error] No languages could be loaded from filelists.", file=sys.stderr)
         return 1
 
     if args.langs:
         requested = {l.upper() for l in args.langs}
         missing = requested - set(lang_map)
         if missing:
-            print(f"[warn] Not found: {sorted(missing)}", file=sys.stderr)
+            print(f"[warn] Requested but no filelist found for: {sorted(missing)}", file=sys.stderr)
         lang_map = {l: f for l, f in lang_map.items() if l in requested}
 
     use_spacy = not args.no_spacy
@@ -240,19 +299,20 @@ def main() -> int:
         print(f"    types: {len(rows):,}  |  tokens: {n_tokens:,}  ->  {out_path}")
 
     tokenizer_desc = (
-        "spaCy (tokenizer only, no pipeline) with regex fallback for CS/ET/GA/HU/LV/MT/SK"
+        "spaCy (tokenizer only, no pipeline) with regex fallback for HU, (others without model)"
         if use_spacy
-        else "regex [^\\W\\d_]+ (Unicode letter sequences)"
+        else "regex [^\\W\\d_]+ (Unicode letter sequences, all languages)"
     )
 
+    print("\n=== All done ===")
     print(
         "\nFor your Methods section:\n"
-        f"  Tokenizer : {tokenizer_desc}\n"
-        "  Lowercase : yes\n"
-        "  Length    : Unicode character count\n"
-        "  Excluded  : digits, punctuation, spaces\n"
-        "  Corpus    : DCEP OQ + QT subdirs; REPORT excluded (absent in some languages)\n"
-        f"  Min freq  : {args.min_freq}"
+        f"  Tokenizer  : {tokenizer_desc}\n"
+        "  Lowercase  : yes\n"
+        "  Length     : Unicode character count\n"
+        "  Excluded   : digits, punctuation, spaces\n"
+        "  Corpus     : parallel subset from DCEP cross-lingual index\n"
+        f"  Min freq   : {args.min_freq}"
     )
     return 0
 
